@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 cubloaty - Analyze CUDA binary sizes in .so files
 Similar to bloaty but for CUDA kernels
@@ -13,14 +12,10 @@ import json
 from collections import defaultdict
 import re
 
-try:
-    from rich.console import Console
-    from rich.table import Table
-    from rich.panel import Panel
-    from rich import box
-    RICH_AVAILABLE = True
-except ImportError:
-    RICH_AVAILABLE = False
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich import box
 
 def extract_cubins(so_file):
     """Extract cubin sections from .so file"""
@@ -324,7 +319,7 @@ Examples:
         sys.exit(1)
 
     # Determine if we should use rich
-    use_rich = RICH_AVAILABLE and not args.no_color and args.format == 'table'
+    use_rich = not args.no_color and args.format == 'table'
     console = Console() if use_rich else None
 
     # Check if input is a cubin file
