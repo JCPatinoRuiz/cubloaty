@@ -221,7 +221,7 @@ pip install -e .
 
 Or install directly from git:
 ```bash
-pip install git+https://github.com/yzh119/cubloaty.git
+pip install git+https://github.com/flashinfer-ai/cubloaty.git
 ```
 
 ## Usage
