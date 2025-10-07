@@ -123,26 +123,69 @@ def demangle_symbol(symbol):
         return symbol
 
 def analyze_cubin_sizes(cubin_file):
-    """Analyze a single cubin file and return symbol sizes using readelf and size"""
+    """Analyze a single cubin file and return symbol sizes and section breakdown"""
     symbols = {}
 
-    # First, try to get the total text size using the 'size' command
-    total_text_size = 0
+    # Get file size for the cubin
     try:
-        size_result = subprocess.run(
-            ['size', cubin_file],
+        file_size = os.path.getsize(cubin_file)
+    except:
+        file_size = 0
+
+    # Parse all sections using readelf
+    section_sizes = {}
+    try:
+        result = subprocess.run(
+            ['readelf', '-SW', cubin_file],
             capture_output=True,
             text=True,
             check=True
         )
-        # Parse output: "text\tdata\tbss\tdec\thex\tfilename"
-        lines = size_result.stdout.strip().split('\n')
-        if len(lines) >= 2:
-            parts = lines[1].split()
-            if parts:
-                total_text_size = int(parts[0])
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+
+        # Parse section headers to get sizes
+        for line in result.stdout.split('\n'):
+            # Match lines like:  [ 5] .debug_line  PROGBITS  0000000000000000 009298 039e76 00  0  0  1
+            match = re.match(r'\s+\[\s*\d+\]\s+(\S+)\s+\S+\s+\S+\s+\S+\s+([0-9a-f]+)', line)
+            if match:
+                section_name = match.group(1)
+                size_hex = match.group(2)
+                size = int(size_hex, 16)
+                if size > 0:
+                    section_sizes[section_name] = size
+    except (subprocess.CalledProcessError, FileNotFoundError):
         pass
+
+    # Categorize sections
+    code_size = 0
+    debug_size = 0
+    data_size = 0
+    metadata_size = 0
+
+    for section_name, size in section_sizes.items():
+        # Code sections (including MERC compressed code)
+        if section_name.startswith('.text.') or section_name.startswith('.nv.capmerc.text.'):
+            code_size += size
+        # Debug sections (including MERC debug sections)
+        elif (section_name.startswith('.debug_') or
+              section_name.startswith('.nv_debug_') or
+              section_name.startswith('.nv.debug_') or
+              section_name.startswith('.nv.merc.debug_') or
+              section_name.startswith('.nv.merc.nv_debug_')):
+            debug_size += size
+        # Data sections
+        elif (section_name.startswith('.nv.shared.') or
+              section_name.startswith('.nv.constant') or
+              section_name.startswith('.nv.global')):
+            data_size += size
+        # Metadata sections (including MERC metadata)
+        elif (section_name in ['.symtab', '.strtab', '.shstrtab'] or
+              section_name.startswith('.nv.info') or
+              section_name.startswith('.nv.merc.nv.info') or
+              section_name.startswith('.nv.merc.symtab') or
+              section_name.startswith('.nv.merc.strtab') or
+              section_name.startswith('.nv.merc.shstrtab') or
+              section_name.startswith('.rela.')):
+            metadata_size += size
 
     # Get function symbols using readelf
     try:
@@ -153,7 +196,6 @@ def analyze_cubin_sizes(cubin_file):
             check=True
         )
 
-        func_total = 0
         # Parse readelf output to extract function names and sizes
         for line in result.stdout.split('\n'):
             # Look for FUNC entries
@@ -169,16 +211,17 @@ def analyze_cubin_sizes(cubin_file):
                             # Demangle the symbol
                             demangled = demangle_symbol(name)
                             symbols[demangled] = size
-                            func_total += size
                     except (ValueError, IndexError):
                         continue
 
-        # If we have a text size from 'size' command and it's larger than function symbols,
-        # add an entry for unlabeled code
-        if total_text_size > func_total and func_total > 0:
-            unlabeled_size = total_text_size - func_total
-            if unlabeled_size > 0:
-                symbols['[other code sections]'] = unlabeled_size
+        # Add section breakdown as special entries
+        # Use a special prefix to avoid Rich markup interpretation
+        if debug_size > 0:
+            symbols['<debug info>'] = debug_size
+        if data_size > 0:
+            symbols['<data sections>'] = data_size
+        if metadata_size > 0:
+            symbols['<metadata>'] = metadata_size
 
         return symbols
     except subprocess.CalledProcessError:
@@ -235,15 +278,21 @@ def shorten_kernel_name(name, max_length=80):
             return '...' + '::'.join(parts[-2:])
     return name[:max_length-3] + "..."
 
-def output_json(all_symbols, symbols_by_arch, arch_totals):
+def output_json(all_symbols, symbols_by_arch, arch_totals, special_sections=None, actual_kernels=None):
     """Output results in JSON format"""
-    sorted_symbols = sorted(all_symbols.items(), key=lambda x: x[1], reverse=True)
     total_size = sum(all_symbols.values())
+    kernels_total_size = sum(actual_kernels.values()) if actual_kernels else total_size
+    special_total_size = sum(special_sections.values()) if special_sections else 0
 
     result = {
         "total_size": total_size,
         "total_size_formatted": format_size(total_size),
+        "kernel_code_size": kernels_total_size,
+        "kernel_code_size_formatted": format_size(kernels_total_size),
+        "non_code_size": special_total_size,
+        "non_code_size_formatted": format_size(special_total_size),
         "architectures": {},
+        "non_code_sections": [],
         "kernels": []
     }
 
@@ -257,23 +306,37 @@ def output_json(all_symbols, symbols_by_arch, arch_totals):
             "percentage": round(percentage, 2)
         }
 
-    # Overall kernels
-    for name, size in sorted_symbols:
-        percentage = (size / total_size * 100) if total_size > 0 else 0
-        kernel_info = {
-            "name": name,
-            "size": size,
-            "size_formatted": format_size(size),
-            "percentage": round(percentage, 2)
-        }
+    # Non-code sections
+    if special_sections:
+        sorted_special = sorted(special_sections.items(), key=lambda x: x[1], reverse=True)
+        for name, size in sorted_special:
+            percentage = (size / total_size * 100) if total_size > 0 else 0
+            result["non_code_sections"].append({
+                "name": name.strip('<>'),
+                "size": size,
+                "size_formatted": format_size(size),
+                "percentage_of_total": round(percentage, 2)
+            })
 
-        # Add per-arch breakdown if available
-        kernel_info["by_arch"] = {}
-        for arch in symbols_by_arch:
-            if name in symbols_by_arch[arch]:
-                kernel_info["by_arch"][arch] = symbols_by_arch[arch][name]
+    # Actual CUDA kernels
+    if actual_kernels:
+        sorted_kernels = sorted(actual_kernels.items(), key=lambda x: x[1], reverse=True)
+        for name, size in sorted_kernels:
+            percentage = (size / kernels_total_size * 100) if kernels_total_size > 0 else 0
+            kernel_info = {
+                "name": name,
+                "size": size,
+                "size_formatted": format_size(size),
+                "percentage_of_code": round(percentage, 2)
+            }
 
-        result["kernels"].append(kernel_info)
+            # Add per-arch breakdown if available
+            kernel_info["by_arch"] = {}
+            for arch in symbols_by_arch:
+                if name in symbols_by_arch[arch]:
+                    kernel_info["by_arch"][arch] = symbols_by_arch[arch][name]
+
+            result["kernels"].append(kernel_info)
 
     print(json.dumps(result, indent=2))
 
@@ -470,6 +533,25 @@ Examples:
         symbols_by_arch = {args.arch: symbols_by_arch[args.arch]}
         arch_totals = {args.arch: arch_totals[args.arch]}
 
+    # Separate debug/metadata from actual kernels
+    special_sections = {}
+    actual_kernels = {}
+    special_sections_by_arch = defaultdict(lambda: defaultdict(int))
+    actual_kernels_by_arch = defaultdict(lambda: defaultdict(int))
+
+    for name, size in all_symbols.items():
+        if name.startswith('<') and name.endswith('>'):
+            special_sections[name] = size
+        else:
+            actual_kernels[name] = size
+
+    for arch in symbols_by_arch:
+        for name, size in symbols_by_arch[arch].items():
+            if name.startswith('<') and name.endswith('>'):
+                special_sections_by_arch[arch][name] = size
+            else:
+                actual_kernels_by_arch[arch][name] = size
+
     # Filter by regex pattern if specified
     if args.filter:
         try:
@@ -479,31 +561,29 @@ Examples:
             sys.exit(1)
 
         # Count before filtering
-        total_before = len(all_symbols)
+        total_before = len(actual_kernels)
 
-        # Filter all_symbols
-        all_symbols = {name: size for name, size in all_symbols.items() if pattern.search(name)}
+        # Filter actual_kernels
+        actual_kernels = {name: size for name, size in actual_kernels.items() if pattern.search(name)}
 
-        # Filter symbols_by_arch
-        for arch in symbols_by_arch:
-            symbols_by_arch[arch] = {name: size for name, size in symbols_by_arch[arch].items() if pattern.search(name)}
-            # Recalculate arch totals
-            arch_totals[arch] = sum(symbols_by_arch[arch].values())
+        # Filter actual_kernels_by_arch
+        for arch in actual_kernels_by_arch:
+            actual_kernels_by_arch[arch] = {name: size for name, size in actual_kernels_by_arch[arch].items() if pattern.search(name)}
 
         if args.verbose:
-            matched = len(all_symbols)
+            matched = len(actual_kernels)
             if console:
                 console.print(f"\n[yellow]📋 Filter:[/yellow] Matched {matched}/{total_before} kernels with pattern '{args.filter}'")
             else:
                 print(f"\nFilter: Matched {matched}/{total_before} kernels with pattern '{args.filter}'")
 
-        if not all_symbols:
+        if not actual_kernels:
             print(f"No kernels matched the filter pattern '{args.filter}'")
             sys.exit(0)
 
     # Output based on format
     if args.format == 'json':
-        output_json(all_symbols, symbols_by_arch, arch_totals)
+        output_json(all_symbols, symbols_by_arch, arch_totals, special_sections, actual_kernels)
         return
 
     # Print results using rich tables
@@ -529,52 +609,78 @@ Examples:
             console.print(arch_table)
             console.print()
 
+        # Special sections table (debug info, metadata, etc.)
+        if special_sections:
+            special_table = Table(title="Non-Code Sections (Debug Info, Metadata, etc.)", box=box.ROUNDED, show_header=True, header_style="bold magenta")
+            special_table.add_column("Section Type", style="dim cyan", width=25)
+            special_table.add_column("Total Size", justify="right", style="yellow", width=15)
+            special_table.add_column("% of Total", justify="right", style="green", width=12)
+
+            sorted_special = sorted(special_sections.items(), key=lambda x: x[1], reverse=True)
+            total_size = sum(all_symbols.values())
+            special_total = sum(special_sections.values())
+
+            for name, size in sorted_special:
+                # Remove the < > markers for display
+                display_name = name.strip('<>')
+                percentage = (size / total_size * 100) if total_size > 0 else 0
+                special_table.add_row(display_name, format_size(size), f"{percentage:.1f}%")
+
+            special_table.add_section()
+            special_pct = (special_total / total_size * 100) if total_size > 0 else 0
+            special_table.add_row("[bold]SUBTOTAL[/bold]", f"[bold]{format_size(special_total)}[/bold]", f"[bold]{special_pct:.1f}%[/bold]")
+            console.print(special_table)
+            console.print()
+
         # Overall top kernels table
-        title = "Top Kernels (All Architectures)" if not args.arch else f"Top Kernels ({args.arch.upper()})"
+        title = "Top CUDA Kernels (All Architectures)" if not args.arch else f"Top CUDA Kernels ({args.arch.upper()})"
         if args.filter:
             title += f" - Filter: '{args.filter}'"
         kernel_table = Table(title=title, box=box.ROUNDED, show_header=True, header_style="bold magenta")
         kernel_table.add_column("Rank", style="dim", width=6, justify="right")
         name_width = 120 if args.full_names else 70
         kernel_table.add_column("Kernel Name", style="cyan", width=name_width)
-        kernel_table.add_column("Total Size", justify="right", style="yellow", width=12)
-        kernel_table.add_column("%", justify="right", style="green", width=8)
+        kernel_table.add_column("Code Size", justify="right", style="yellow", width=12)
+        kernel_table.add_column("% of Code", justify="right", style="green", width=10)
 
-        sorted_symbols = sorted(all_symbols.items(), key=lambda x: x[1], reverse=True)
+        sorted_kernels = sorted(actual_kernels.items(), key=lambda x: x[1], reverse=True)
+        kernels_total_size = sum(actual_kernels.values())
         total_size = sum(all_symbols.values())
 
         # Show top N kernels
-        display_count = min(args.top, len(sorted_symbols))
-        for idx, (name, size) in enumerate(sorted_symbols[:display_count], 1):
-            percentage = (size / total_size * 100) if total_size > 0 else 0
+        display_count = min(args.top, len(sorted_kernels))
+        for idx, (name, size) in enumerate(sorted_kernels[:display_count], 1):
+            # Percentage relative to kernel code only
+            percentage = (size / kernels_total_size * 100) if kernels_total_size > 0 else 0
             short_name = name if args.full_names else shorten_kernel_name(name, name_width)
             kernel_table.add_row(str(idx), short_name, format_size(size), f"{percentage:.1f}%")
 
-        if len(sorted_symbols) > display_count:
-            kernel_table.add_row("...", f"[dim]({len(sorted_symbols) - display_count} more kernels)[/dim]", "", "")
+        if len(sorted_kernels) > display_count:
+            kernel_table.add_row("...", f"[dim]({len(sorted_kernels) - display_count} more kernels)[/dim]", "", "")
 
         kernel_table.add_section()
-        kernel_table.add_row("", "[bold]TOTAL[/bold]", f"[bold]{format_size(total_size)}[/bold]", "[bold]100.0%[/bold]")
+        kernels_pct = (kernels_total_size / total_size * 100) if total_size > 0 else 0
+        kernel_table.add_row("", "[bold]TOTAL KERNEL CODE[/bold]", f"[bold]{format_size(kernels_total_size)}[/bold]", f"[bold]{kernels_pct:.1f}% of file[/bold]")
         console.print(kernel_table)
 
         # Per-architecture breakdown (only if not filtering and multiple archs)
-        if not args.arch and len(symbols_by_arch) > 1:
-            for arch in sorted(symbols_by_arch.keys()):
+        if not args.arch and len(actual_kernels_by_arch) > 1:
+            for arch in sorted(actual_kernels_by_arch.keys()):
                 console.print()
-                arch_symbols = symbols_by_arch[arch]
-                arch_sorted = sorted(arch_symbols.items(), key=lambda x: x[1], reverse=True)
-                arch_total = sum(arch_symbols.values())
+                arch_kernels = actual_kernels_by_arch[arch]
+                arch_sorted = sorted(arch_kernels.items(), key=lambda x: x[1], reverse=True)
+                arch_kernel_total = sum(arch_kernels.values())
 
-                per_arch_table = Table(title=f"Kernels for {arch.upper()}", box=box.ROUNDED, show_header=True, header_style="bold magenta")
+                per_arch_table = Table(title=f"CUDA Kernels for {arch.upper()}", box=box.ROUNDED, show_header=True, header_style="bold magenta")
                 per_arch_table.add_column("Rank", style="dim", width=6, justify="right")
                 per_arch_table.add_column("Kernel Name", style="cyan", width=name_width)
-                per_arch_table.add_column("Size", justify="right", style="yellow", width=12)
-                per_arch_table.add_column("%", justify="right", style="green", width=8)
+                per_arch_table.add_column("Code Size", justify="right", style="yellow", width=12)
+                per_arch_table.add_column("% of Code", justify="right", style="green", width=10)
 
                 # Show top 15 per architecture
                 arch_display = min(15, len(arch_sorted))
                 for idx, (name, size) in enumerate(arch_sorted[:arch_display], 1):
-                    percentage = (size / arch_total * 100) if arch_total > 0 else 0
+                    percentage = (size / arch_kernel_total * 100) if arch_kernel_total > 0 else 0
                     short_name = name if args.full_names else shorten_kernel_name(name, name_width)
                     per_arch_table.add_row(str(idx), short_name, format_size(size), f"{percentage:.1f}%")
 
@@ -582,7 +688,7 @@ Examples:
                     per_arch_table.add_row("...", f"[dim]({len(arch_sorted) - arch_display} more kernels)[/dim]", "", "")
 
                 per_arch_table.add_section()
-                per_arch_table.add_row("", "[bold]TOTAL[/bold]", f"[bold]{format_size(arch_total)}[/bold]", "[bold]100.0%[/bold]")
+                per_arch_table.add_row("", "[bold]TOTAL KERNEL CODE[/bold]", f"[bold]{format_size(arch_kernel_total)}[/bold]", "[bold]100.0%[/bold]")
                 console.print(per_arch_table)
 
         console.print("\n[bold green]✓ Analysis complete![/bold green]\n")
@@ -592,24 +698,39 @@ Examples:
         print("CUDA Kernel Size Report")
         print("="*100)
 
-        sorted_symbols = sorted(all_symbols.items(), key=lambda x: x[1], reverse=True)
+        # Print special sections first
+        if special_sections:
+            print("\nNon-Code Sections (Debug Info, Metadata, etc.):")
+            print("-"*100)
+            sorted_special = sorted(special_sections.items(), key=lambda x: x[1], reverse=True)
+            total_size = sum(all_symbols.values())
+            for name, size in sorted_special:
+                display_name = name.strip('<>')
+                percentage = (size / total_size * 100) if total_size > 0 else 0
+                print(f"{display_name:<70} {format_size(size):>15} {percentage:>9.1f}%")
+            print()
+
+        # Print actual kernels
+        sorted_kernels = sorted(actual_kernels.items(), key=lambda x: x[1], reverse=True)
+        kernels_total_size = sum(actual_kernels.values())
         total_size = sum(all_symbols.values())
 
         name_width = 90 if args.full_names else 70
-        print(f"\n{'Kernel Name':<{name_width}} {'Size':>15} {'%':>10}")
+        print(f"\n{'CUDA Kernel Name':<{name_width}} {'Code Size':>15} {'% of Code':>12}")
         print("-"*100)
 
-        display_count = min(args.top, len(sorted_symbols))
-        for name, size in sorted_symbols[:display_count]:
-            percentage = (size / total_size * 100) if total_size > 0 else 0
+        display_count = min(args.top, len(sorted_kernels))
+        for name, size in sorted_kernels[:display_count]:
+            percentage = (size / kernels_total_size * 100) if kernels_total_size > 0 else 0
             short_name = name if args.full_names else shorten_kernel_name(name, name_width)
-            print(f"{short_name:<{name_width}} {format_size(size):>15} {percentage:>9.1f}%")
+            print(f"{short_name:<{name_width}} {format_size(size):>15} {percentage:>11.1f}%")
 
-        if len(sorted_symbols) > display_count:
-            print(f"... ({len(sorted_symbols) - display_count} more kernels)")
+        if len(sorted_kernels) > display_count:
+            print(f"... ({len(sorted_kernels) - display_count} more kernels)")
 
         print("-"*100)
-        print(f"{'TOTAL':<{name_width}} {format_size(total_size):>15} {'100.0%':>10}")
+        kernels_pct = (kernels_total_size / total_size * 100) if total_size > 0 else 0
+        print(f"{'TOTAL KERNEL CODE':<{name_width}} {format_size(kernels_total_size):>15} {kernels_pct:>10.1f}% of file")
         print()
 
 if __name__ == '__main__':
