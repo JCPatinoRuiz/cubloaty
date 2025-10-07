@@ -11,11 +11,44 @@ import argparse
 import json
 from collections import defaultdict
 import re
+import logging
 
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich import box
+from rich.logging import RichHandler
+
+# Get logger for this module
+logger = logging.getLogger("cubloaty")
+
+
+def setup_logging(verbose=False):
+    """Setup logging configuration with Rich handler
+
+    Rich automatically detects terminal capabilities and falls back to
+    plain text when output is redirected or terminal doesn't support colors.
+
+    Args:
+        verbose: If True, set level to DEBUG, otherwise WARNING (quiet by default)
+    """
+    level = logging.DEBUG if verbose else logging.WARNING
+
+    # Clear any existing handlers
+    logger.handlers.clear()
+
+    # Always use Rich handler - it handles plain terminals gracefully
+    handler = RichHandler(
+        rich_tracebacks=True,
+        show_time=False,
+        show_path=False,
+        markup=True,
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    logger.addHandler(handler)
+    logger.setLevel(level)
+
 
 def extract_cubins(so_file):
     """Extract cubin sections from .so file"""
@@ -24,60 +57,64 @@ def extract_cubins(so_file):
     # Use objcopy to extract .nv_fatbin sections
     try:
         result = subprocess.run(
-            ['objdump', '-h', so_file],
-            capture_output=True,
-            text=True,
-            check=True
+            ["objdump", "-h", so_file], capture_output=True, text=True, check=True
         )
 
         # Find all CUDA-related sections
-        for line in result.stdout.split('\n'):
-            if '.nv_fatbin' in line or 'nv_fatbin' in line:
+        for line in result.stdout.split("\n"):
+            if ".nv_fatbin" in line or "nv_fatbin" in line:
                 # Extract section name
                 parts = line.split()
                 if len(parts) > 1:
                     section_name = parts[1]
                     cubins.append(section_name)
-    except subprocess.CalledProcessError:
-        print(f"Error: Could not read sections from {so_file}")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Could not read sections from {so_file}: {e}")
         return []
 
     return cubins
+
 
 def extract_cubin_data(so_file, section_name, output_file):
     """Extract cubin binary data from section"""
     try:
         subprocess.run(
-            ['objcopy', '--dump-section', f'{section_name}={output_file}', so_file],
+            ["objcopy", "--dump-section", f"{section_name}={output_file}", so_file],
             check=True,
-            capture_output=True
+            capture_output=True,
         )
         return True
     except subprocess.CalledProcessError:
         return False
 
+
 def extract_cubins_from_fatbin(fatbin_file, output_dir):
-    """Extract individual cubins from a fatbin using cuobjdump"""
+    """Extract individual cubins from a fatbin using cuobjdump
+
+    This function attempts to extract CUDA ELF binaries from a fatbin container.
+    If cuobjdump is not available, it logs an error and returns empty list.
+    """
     try:
         # First, list all ELF files in the fatbin
         result = subprocess.run(
-            ['cuobjdump', '-lelf', fatbin_file],
+            ["cuobjdump", "-lelf", fatbin_file],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
         )
 
         # Parse the output to get cubin names
         cubin_names = []
-        for line in result.stdout.split('\n'):
-            if 'ELF file' in line:
+        for line in result.stdout.split("\n"):
+            if "ELF file" in line:
                 # Extract the filename from "ELF file    1: filename.cubin"
-                parts = line.split(':', 1)
+                parts = line.split(":", 1)
                 if len(parts) == 2:
                     cubin_name = parts[1].strip()
                     cubin_names.append(cubin_name)
 
         if not cubin_names:
+            logger.debug(f"No ELF files found in fatbin: {fatbin_file}")
             return []
 
         # Extract all cubins at once using 'all'
@@ -86,9 +123,9 @@ def extract_cubins_from_fatbin(fatbin_file, output_dir):
         try:
             os.chdir(output_dir)
             subprocess.run(
-                ['cuobjdump', '-xelf', 'all', fatbin_file],
+                ["cuobjdump", "-xelf", "all", fatbin_file],
                 capture_output=True,
-                check=True
+                check=True,
             )
 
             # Find all extracted .cubin files
@@ -98,62 +135,79 @@ def extract_cubins_from_fatbin(fatbin_file, output_dir):
                 if os.path.exists(cubin_path):
                     extracted_files.append((cubin_name, cubin_path))
 
+            logger.debug(f"Extracted {len(extracted_files)} cubin(s) from fatbin")
             return extracted_files
         finally:
             os.chdir(old_cwd)
 
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as e:
+        logger.debug(f"Failed to extract cubins from fatbin: {e}")
         return []
     except FileNotFoundError:
-        print("Error: cuobjdump not found. Please ensure CUDA toolkit is installed and in PATH.")
+        logger.error(
+            "cuobjdump not found. Please ensure CUDA toolkit is installed and in PATH."
+        )
         return []
 
+
 def demangle_symbol(symbol):
-    """Demangle C++ symbol names"""
+    """Demangle C++ symbol names
+
+    Uses c++filt to demangle C++ symbols. If demangling fails,
+    returns the original symbol name.
+    """
     try:
         result = subprocess.run(
-            ['c++filt', symbol],
-            capture_output=True,
-            text=True,
-            check=True
+            ["c++filt", symbol], capture_output=True, text=True, check=True
         )
         demangled = result.stdout.strip()
         return demangled if demangled else symbol
-    except:
+    except Exception as e:
+        # Symbol demangling failure is not critical, just return original
+        logger.debug(f"Failed to demangle symbol {symbol}: {e}")
         return symbol
 
-def analyze_cubin_sizes(cubin_file):
-    """Analyze a single cubin file and return symbol sizes and section breakdown"""
-    symbols = {}
 
-    # Get file size for the cubin
-    try:
-        file_size = os.path.getsize(cubin_file)
-    except:
-        file_size = 0
+def analyze_cubin_sizes(cubin_file):
+    """Analyze a single cubin file and return symbol sizes and section breakdown
+
+    This function uses readelf to parse ELF sections and symbols from a cubin file.
+    If the file is not a valid ELF (e.g., it's a fatbin container), it returns
+    empty results and the caller should try extracting cubins from it.
+
+    Returns:
+        tuple: (symbols_dict, text_section_size)
+            - symbols_dict: Dictionary mapping symbol names to sizes (includes special sections)
+            - text_section_size: Total size of .text.* sections from section headers
+    """
+    symbols = {}
 
     # Parse all sections using readelf
     section_sizes = {}
     try:
         result = subprocess.run(
-            ['readelf', '-SW', cubin_file],
-            capture_output=True,
-            text=True,
-            check=True
+            ["readelf", "-SW", cubin_file], capture_output=True, text=True, check=True
         )
 
         # Parse section headers to get sizes
-        for line in result.stdout.split('\n'):
+        for line in result.stdout.split("\n"):
             # Match lines like:  [ 5] .debug_line  PROGBITS  0000000000000000 009298 039e76 00  0  0  1
-            match = re.match(r'\s+\[\s*\d+\]\s+(\S+)\s+\S+\s+\S+\s+\S+\s+([0-9a-f]+)', line)
+            match = re.match(
+                r"\s+\[\s*\d+\]\s+(\S+)\s+\S+\s+\S+\s+\S+\s+([0-9a-f]+)", line
+            )
             if match:
                 section_name = match.group(1)
                 size_hex = match.group(2)
                 size = int(size_hex, 16)
                 if size > 0:
                     section_sizes[section_name] = size
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
+    except subprocess.CalledProcessError:
+        # This is expected for fatbin files - caller will try extracting cubins
+        logger.debug(f"Could not parse ELF sections from {cubin_file}, may be a fatbin")
+        return {}, 0
+    except FileNotFoundError:
+        logger.error("readelf not found. Please ensure binutils is installed.")
+        return {}, 0
 
     # Categorize sections
     code_size = 0
@@ -163,43 +217,48 @@ def analyze_cubin_sizes(cubin_file):
 
     for section_name, size in section_sizes.items():
         # Code sections (including MERC compressed code)
-        if section_name.startswith('.text.') or section_name.startswith('.nv.capmerc.text.'):
+        if section_name.startswith(".text.") or section_name.startswith(
+            ".nv.capmerc.text."
+        ):
             code_size += size
         # Debug sections (including MERC debug sections)
-        elif (section_name.startswith('.debug_') or
-              section_name.startswith('.nv_debug_') or
-              section_name.startswith('.nv.debug_') or
-              section_name.startswith('.nv.merc.debug_') or
-              section_name.startswith('.nv.merc.nv_debug_')):
+        elif (
+            section_name.startswith(".debug_")
+            or section_name.startswith(".nv_debug_")
+            or section_name.startswith(".nv.debug_")
+            or section_name.startswith(".nv.merc.debug_")
+            or section_name.startswith(".nv.merc.nv_debug_")
+        ):
             debug_size += size
         # Data sections
-        elif (section_name.startswith('.nv.shared.') or
-              section_name.startswith('.nv.constant') or
-              section_name.startswith('.nv.global')):
+        elif (
+            section_name.startswith(".nv.shared.")
+            or section_name.startswith(".nv.constant")
+            or section_name.startswith(".nv.global")
+        ):
             data_size += size
         # Metadata sections (including MERC metadata)
-        elif (section_name in ['.symtab', '.strtab', '.shstrtab'] or
-              section_name.startswith('.nv.info') or
-              section_name.startswith('.nv.merc.nv.info') or
-              section_name.startswith('.nv.merc.symtab') or
-              section_name.startswith('.nv.merc.strtab') or
-              section_name.startswith('.nv.merc.shstrtab') or
-              section_name.startswith('.rela.')):
+        elif (
+            section_name in [".symtab", ".strtab", ".shstrtab"]
+            or section_name.startswith(".nv.info")
+            or section_name.startswith(".nv.merc.nv.info")
+            or section_name.startswith(".nv.merc.symtab")
+            or section_name.startswith(".nv.merc.strtab")
+            or section_name.startswith(".nv.merc.shstrtab")
+            or section_name.startswith(".rela.")
+        ):
             metadata_size += size
 
     # Get function symbols using readelf
     try:
         result = subprocess.run(
-            ['readelf', '-sW', cubin_file],
-            capture_output=True,
-            text=True,
-            check=True
+            ["readelf", "-sW", cubin_file], capture_output=True, text=True, check=True
         )
 
         # Parse readelf output to extract function names and sizes
-        for line in result.stdout.split('\n'):
+        for line in result.stdout.split("\n"):
             # Look for FUNC entries
-            if 'FUNC' in line:
+            if "FUNC" in line:
                 parts = line.split()
                 if len(parts) >= 8:
                     try:
@@ -212,59 +271,71 @@ def analyze_cubin_sizes(cubin_file):
                             demangled = demangle_symbol(name)
                             symbols[demangled] = size
                     except (ValueError, IndexError):
+                        # Skip malformed symbol entries
                         continue
 
         # Add section breakdown as special entries
         # Use a special prefix to avoid Rich markup interpretation
         if debug_size > 0:
-            symbols['<debug info>'] = debug_size
+            symbols["<Debug Info>"] = debug_size
         if data_size > 0:
-            symbols['<data sections>'] = data_size
+            symbols["<Data Sections>"] = data_size
         if metadata_size > 0:
-            symbols['<metadata>'] = metadata_size
+            symbols["<Metadata>"] = metadata_size
 
-        return symbols
+        return symbols, code_size
     except subprocess.CalledProcessError:
-        return {}
+        # This is expected for fatbin files - caller will try extracting cubins
+        logger.debug(f"Could not analyze symbols from {cubin_file}")
+        return {}, 0
     except FileNotFoundError:
-        print("Error: readelf not found. Please ensure binutils is installed.")
-        return {}
+        logger.error("readelf not found. Please ensure binutils is installed.")
+        return {}, 0
+
 
 def format_size(size_bytes):
     """Format size in human-readable format"""
     if size_bytes < 1024:
         return f"{size_bytes}B"
     elif size_bytes < 1024 * 1024:
-        return f"{size_bytes/1024:.1f}KB"
+        return f"{size_bytes / 1024:.1f}KB"
     else:
-        return f"{size_bytes/(1024*1024):.1f}MB"
+        return f"{size_bytes / (1024 * 1024):.1f}MB"
+
 
 def extract_sm_arch(cubin_name):
     """Extract SM architecture from cubin filename (e.g., 'sm_90a' from 'kernel.sm_90a.cubin')"""
-    match = re.search(r'\.sm_(\d+[a-z]?)\.cubin', cubin_name)
+    match = re.search(r"\.sm_(\d+[a-z]?)\.cubin", cubin_name)
     if match:
         return f"sm_{match.group(1)}"
     return "unknown"
 
+
 def get_cubin_arch(cubin_file):
-    """Get architecture from cubin file using cuobjdump"""
+    """Get architecture from cubin file using cuobjdump
+
+    Tries to determine SM architecture using cuobjdump, falls back to
+    parsing the filename if cuobjdump is not available.
+    """
     try:
         result = subprocess.run(
-            ['cuobjdump', '-lelf', cubin_file],
+            ["cuobjdump", "-lelf", cubin_file],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
         )
         # Parse output like "ELF file    1: kernel.sm_90.cubin"
-        for line in result.stdout.split('\n'):
-            if 'ELF file' in line and '.sm_' in line:
-                match = re.search(r'\.sm_(\d+[a-z]?)\.cubin', line)
+        for line in result.stdout.split("\n"):
+            if "ELF file" in line and ".sm_" in line:
+                match = re.search(r"\.sm_(\d+[a-z]?)\.cubin", line)
                 if match:
                     return f"sm_{match.group(1)}"
         return "unknown"
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
         # Fallback to filename-based detection
+        logger.debug(f"Could not get architecture from cuobjdump, using filename: {e}")
         return extract_sm_arch(cubin_file)
+
 
 def shorten_kernel_name(name, max_length=80):
     """Shorten kernel name for display"""
@@ -272,13 +343,20 @@ def shorten_kernel_name(name, max_length=80):
         return name
     # Try to extract the main function name
     # For templates like ClassName<Args>::method, try to keep the most important part
-    if '::' in name:
-        parts = name.split('::')
+    if "::" in name:
+        parts = name.split("::")
         if len(parts[-1]) < max_length:
-            return '...' + '::'.join(parts[-2:])
-    return name[:max_length-3] + "..."
+            return "..." + "::".join(parts[-2:])
+    return name[: max_length - 3] + "..."
 
-def output_json(all_symbols, symbols_by_arch, arch_totals, special_sections=None, actual_kernels=None):
+
+def output_json(
+    all_symbols,
+    symbols_by_arch,
+    arch_totals,
+    special_sections=None,
+    actual_kernels=None,
+):
     """Output results in JSON format"""
     total_size = sum(all_symbols.values())
     kernels_total_size = sum(actual_kernels.values()) if actual_kernels else total_size
@@ -293,41 +371,53 @@ def output_json(all_symbols, symbols_by_arch, arch_totals, special_sections=None
         "non_code_size_formatted": format_size(special_total_size),
         "architectures": {},
         "non_code_sections": [],
-        "kernels": []
+        "kernels": [],
     }
 
     # Architecture summary
     for arch in sorted(arch_totals.keys()):
         size = arch_totals[arch]
-        percentage = (size / sum(arch_totals.values()) * 100) if sum(arch_totals.values()) > 0 else 0
+        percentage = (
+            (size / sum(arch_totals.values()) * 100)
+            if sum(arch_totals.values()) > 0
+            else 0
+        )
         result["architectures"][arch] = {
             "size": size,
             "size_formatted": format_size(size),
-            "percentage": round(percentage, 2)
+            "percentage": round(percentage, 2),
         }
 
     # Non-code sections
     if special_sections:
-        sorted_special = sorted(special_sections.items(), key=lambda x: x[1], reverse=True)
+        sorted_special = sorted(
+            special_sections.items(), key=lambda x: x[1], reverse=True
+        )
         for name, size in sorted_special:
             percentage = (size / total_size * 100) if total_size > 0 else 0
-            result["non_code_sections"].append({
-                "name": name.strip('<>'),
-                "size": size,
-                "size_formatted": format_size(size),
-                "percentage_of_total": round(percentage, 2)
-            })
+            result["non_code_sections"].append(
+                {
+                    "name": name.strip("<>"),
+                    "size": size,
+                    "size_formatted": format_size(size),
+                    "percentage_of_total": round(percentage, 2),
+                }
+            )
 
     # Actual CUDA kernels
     if actual_kernels:
-        sorted_kernels = sorted(actual_kernels.items(), key=lambda x: x[1], reverse=True)
+        sorted_kernels = sorted(
+            actual_kernels.items(), key=lambda x: x[1], reverse=True
+        )
         for name, size in sorted_kernels:
-            percentage = (size / kernels_total_size * 100) if kernels_total_size > 0 else 0
+            percentage = (
+                (size / kernels_total_size * 100) if kernels_total_size > 0 else 0
+            )
             kernel_info = {
                 "name": name,
                 "size": size,
                 "size_formatted": format_size(size),
-                "percentage_of_code": round(percentage, 2)
+                "percentage_of_code": round(percentage, 2),
             }
 
             # Add per-arch breakdown if available
@@ -340,9 +430,10 @@ def output_json(all_symbols, symbols_by_arch, arch_totals, special_sections=None
 
     print(json.dumps(result, indent=2))
 
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Analyze CUDA binary sizes in .so files - bloaty for CUDA kernels',
+        description="Analyze CUDA binary sizes in .so files - bloaty for CUDA kernels",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -353,70 +444,96 @@ Examples:
   cubloaty library.so --filter "gemm"    # Filter kernels by name (regex)
   cubloaty library.so --format json      # Output as JSON
   cubloaty library.so --full-names       # Show full kernel names
-        """
+        """,
     )
 
-    parser.add_argument('file', help='Path to .so or .cubin file to analyze')
-    parser.add_argument('--top', '-n', type=int, default=30, metavar='N',
-                        help='Show top N kernels (default: 30)')
-    parser.add_argument('--arch', '-a', type=str, metavar='ARCH',
-                        help='Filter by architecture (e.g., sm_90, sm_80)')
-    parser.add_argument('--format', '-f', choices=['table', 'json'], default='table',
-                        help='Output format (default: table)')
-    parser.add_argument('--filter', '-r', type=str, metavar='REGEX',
-                        help='Filter kernel names by regular expression (case-insensitive)')
-    parser.add_argument('--full-names', action='store_true',
-                        help='Show full kernel names without truncation')
-    parser.add_argument('--no-color', action='store_true',
-                        help='Disable colored output')
-    parser.add_argument('--verbose', '-v', action='store_true',
-                        help='Show detailed processing information')
-    parser.add_argument('--version', action='version', version='%(prog)s 0.1.0')
+    parser.add_argument("file", help="Path to .so or .cubin file to analyze")
+    parser.add_argument(
+        "--top",
+        "-n",
+        type=int,
+        default=30,
+        metavar="N",
+        help="Show top N kernels (default: 30)",
+    )
+    parser.add_argument(
+        "--arch",
+        "-a",
+        type=str,
+        metavar="ARCH",
+        help="Filter by architecture (e.g., sm_90, sm_80)",
+    )
+    parser.add_argument(
+        "--format",
+        "-f",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table)",
+    )
+    parser.add_argument(
+        "--filter",
+        "-r",
+        type=str,
+        metavar="REGEX",
+        help="Filter kernel names by regular expression (case-insensitive)",
+    )
+    parser.add_argument(
+        "--full-names",
+        action="store_true",
+        help="Show full kernel names without truncation",
+    )
+    parser.add_argument(
+        "--no-color", action="store_true", help="Disable colored output"
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Show detailed processing information",
+    )
+    parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
 
     args = parser.parse_args()
 
     input_file = args.file
 
+    # Setup logging - Rich handler auto-detects terminal capabilities
+    setup_logging(verbose=args.verbose)
+
+    # Validate input file
     if not os.path.exists(input_file):
-        print(f"Error: File {input_file} not found")
+        logger.error(f"File not found: {input_file}")
         sys.exit(1)
 
-    # Determine if we should use rich
-    use_rich = not args.no_color and args.format == 'table'
+    # Create console for formatted output (tables, etc.)
+    # Only tables need to respect --no-color flag
+    use_rich = not args.no_color and args.format == "table"
     console = Console() if use_rich else None
 
     # Check if input is a cubin file
-    is_cubin = input_file.endswith('.cubin')
+    is_cubin = input_file.endswith(".cubin")
 
-    if args.verbose:
-        if console:
-            file_type = "cubin file" if is_cubin else "shared library"
-            console.print(f"\n[bold cyan]🔍 Analyzing CUDA binaries:[/bold cyan] {os.path.basename(input_file)} ({file_type})")
-        else:
-            print(f"\nAnalyzing CUDA binaries in: {input_file}")
+    file_type = "cubin file" if is_cubin else "shared library"
+    logger.debug(
+        f"[bold cyan]🔍 Analyzing CUDA binaries:[/bold cyan] {os.path.basename(input_file)} ({file_type})"
+    )
 
     # Track symbols by architecture and overall
     symbols_by_arch = defaultdict(lambda: defaultdict(int))
     all_symbols = defaultdict(int)
     arch_totals = defaultdict(int)
+    text_section_size_by_arch = defaultdict(int)  # Track actual .text section sizes
+    total_text_section_size = 0
 
     if is_cubin:
         # Direct cubin analysis
-        if args.verbose:
-            if console:
-                console.print("[yellow]📦 Processing cubin file...[/yellow]")
-            else:
-                print("Processing cubin file...")
+        logger.debug("Processing cubin file...")
 
         # Try to analyze directly
-        symbols = analyze_cubin_sizes(input_file)
+        symbols, text_size = analyze_cubin_sizes(input_file)
 
         if symbols:
-            if args.verbose:
-                if console:
-                    console.print(f"[green]✓[/green] Found {len(symbols)} kernel(s)")
-                else:
-                    print(f"Found {len(symbols)} kernel(s)")
+            logger.debug(f"Found {len(symbols)} symbol(s) in cubin")
 
             # Extract architecture from cubin file
             arch = get_cubin_arch(input_file)
@@ -425,8 +542,11 @@ Examples:
                 all_symbols[name] += size
                 symbols_by_arch[arch][name] += size
                 arch_totals[arch] += size
+
+            text_section_size_by_arch[arch] += text_size
+            total_text_section_size += text_size
         else:
-            print("No symbols found in cubin file")
+            logger.error("No symbols found in cubin file")
             sys.exit(1)
     else:
         # .so file processing (existing logic)
@@ -434,56 +554,40 @@ Examples:
         sections = extract_cubins(input_file)
 
         if not sections:
-            print("No CUDA binary sections found in the file.")
-            if args.verbose:
-                print("Trying to extract using cuobjdump...")
-                try:
-                    subprocess.run(['cuobjdump', '-elf', input_file], check=True)
-                    print("Use cuobjdump -elf <file> to extract cubins manually")
-                except:
-                    pass
+            logger.error("No CUDA binary sections found in the file.")
+            logger.debug("Trying to extract using cuobjdump...")
+            try:
+                subprocess.run(["cuobjdump", "-elf", input_file], check=True)
+                logger.info("Use cuobjdump -elf <file> to extract cubins manually")
+            except Exception:
+                pass
             sys.exit(1)
 
-        if args.verbose:
-            if console:
-                console.print(f"[green]✓[/green] Found {len(sections)} CUDA binary section(s)")
-            else:
-                print(f"Found {len(sections)} CUDA binary section(s)\n")
+        logger.debug(f"Found {len(sections)} CUDA binary section(s)")
 
         # Process each section
         with tempfile.TemporaryDirectory() as tmpdir:
             for i, section in enumerate(sections):
-                if args.verbose:
-                    if console:
-                        console.print(f"\n[bold]📦 Processing section:[/bold] {section}")
-                    else:
-                        print(f"\nProcessing section: {section}")
+                logger.debug(f"Processing section: {section}")
 
-                cubin_file = os.path.join(tmpdir, f'cubin_{i}.bin')
+                cubin_file = os.path.join(tmpdir, f"cubin_{i}.bin")
 
                 if not extract_cubin_data(input_file, section, cubin_file):
-                    if args.verbose:
-                        print(f"  Warning: Could not extract {section}")
+                    logger.warning(f"Could not extract {section}")
                     continue
 
-                # First try to disassemble directly
-                symbols = analyze_cubin_sizes(cubin_file)
+                # First try to analyze directly (may be an ELF cubin)
+                symbols, text_size = analyze_cubin_sizes(cubin_file)
 
-                # If that failed, it might be a fatbin, try extracting cubins from it
+                # If that failed, it's likely a fatbin container, try extracting cubins from it
                 if not symbols:
-                    if args.verbose:
-                        if console:
-                            console.print("  [yellow]🔄 Extracting cubins from fatbin...[/yellow]")
-                        else:
-                            print("  Attempting to extract cubins from fatbin...")
+                    logger.debug("File is a fatbin, extracting individual cubins...")
                     extracted_cubins = extract_cubins_from_fatbin(cubin_file, tmpdir)
 
                     if extracted_cubins:
-                        if args.verbose:
-                            if console:
-                                console.print(f"  [green]✓[/green] Found {len(extracted_cubins)} cubin(s)")
-                            else:
-                                print(f"  Found {len(extracted_cubins)} cubin(s) in fatbin")
+                        logger.debug(
+                            f"Extracted {len(extracted_cubins)} cubin(s) from fatbin"
+                        )
 
                         # Group by architecture
                         arch_groups = defaultdict(list)
@@ -495,37 +599,38 @@ Examples:
                             cubins = arch_groups[arch]
                             arch_kernel_count = 0
                             for cubin_name, cubin_path in cubins:
-                                cubin_symbols = analyze_cubin_sizes(cubin_path)
+                                cubin_symbols, cubin_text_size = analyze_cubin_sizes(
+                                    cubin_path
+                                )
                                 if cubin_symbols:
                                     arch_kernel_count += len(cubin_symbols)
                                     for name, size in cubin_symbols.items():
                                         symbols_by_arch[arch][name] += size
                                         all_symbols[name] += size
                                         arch_totals[arch] += size
+                                    text_section_size_by_arch[arch] += cubin_text_size
+                                    total_text_section_size += cubin_text_size
 
-                            if args.verbose:
-                                if console:
-                                    console.print(f"    [cyan]{arch}[/cyan]: {len(cubins)} cubin(s), {arch_kernel_count} kernel(s), {format_size(arch_totals[arch])}")
-                                else:
-                                    print(f"    {arch}: {len(cubins)} cubin(s), {format_size(arch_totals[arch])}")
+                            logger.debug(
+                                f"  {arch}: {len(cubins)} cubin(s), {arch_kernel_count} kernel(s), {format_size(arch_totals[arch])}"
+                            )
                     else:
-                        if args.verbose:
-                            print(f"  No symbols found in {section}")
+                        logger.warning(f"No symbols found in {section}")
                     continue
 
-                if args.verbose:
-                    if console:
-                        console.print(f"  [green]✓[/green] Found {len(symbols)} kernel(s)")
-                    else:
-                        print(f"  Found {len(symbols)} kernel(s)")
+                logger.debug(f"Found {len(symbols)} symbol(s) in section")
 
                 for name, size in symbols.items():
                     all_symbols[name] += size
 
+                total_text_section_size += text_size
+
     # Filter by architecture if specified
     if args.arch:
         if args.arch not in symbols_by_arch:
-            print(f"Error: Architecture '{args.arch}' not found. Available: {', '.join(sorted(symbols_by_arch.keys()))}")
+            logger.error(
+                f"Architecture '{args.arch}' not found. Available: {', '.join(sorted(symbols_by_arch.keys()))}"
+            )
             sys.exit(1)
         # Replace all_symbols with filtered symbols
         all_symbols = symbols_by_arch[args.arch]
@@ -533,117 +638,172 @@ Examples:
         symbols_by_arch = {args.arch: symbols_by_arch[args.arch]}
         arch_totals = {args.arch: arch_totals[args.arch]}
 
-    # Separate debug/metadata from actual kernels
-    special_sections = {}
-    actual_kernels = {}
-    special_sections_by_arch = defaultdict(lambda: defaultdict(int))
-    actual_kernels_by_arch = defaultdict(lambda: defaultdict(int))
+    # Separate debug/metadata from actual kernels (unified pass)
+    def classify_symbols(symbols_dict):
+        """Classify symbols into special sections and kernels"""
+        special, kernels = {}, {}
+        for name, size in symbols_dict.items():
+            (special if name.startswith("<") and name.endswith(">") else kernels)[
+                name
+            ] = size
+        return special, kernels
 
-    for name, size in all_symbols.items():
-        if name.startswith('<') and name.endswith('>'):
-            special_sections[name] = size
-        else:
-            actual_kernels[name] = size
-
-    for arch in symbols_by_arch:
-        for name, size in symbols_by_arch[arch].items():
-            if name.startswith('<') and name.endswith('>'):
-                special_sections_by_arch[arch][name] = size
-            else:
-                actual_kernels_by_arch[arch][name] = size
+    special_sections, actual_kernels = classify_symbols(all_symbols)
+    special_sections_by_arch = defaultdict(dict)
+    actual_kernels_by_arch = defaultdict(dict)
+    for arch, symbols in symbols_by_arch.items():
+        special_sections_by_arch[arch], actual_kernels_by_arch[arch] = classify_symbols(
+            symbols
+        )
 
     # Filter by regex pattern if specified
     if args.filter:
         try:
             pattern = re.compile(args.filter, re.IGNORECASE)
         except re.error as e:
-            print(f"Error: Invalid regular expression: {e}")
+            logger.error(f"Invalid regular expression: {e}")
             sys.exit(1)
 
         # Count before filtering
         total_before = len(actual_kernels)
 
-        # Filter actual_kernels
-        actual_kernels = {name: size for name, size in actual_kernels.items() if pattern.search(name)}
-
-        # Filter actual_kernels_by_arch
+        # Filter actual_kernels and by_arch in one pass
+        actual_kernels = {
+            name: size for name, size in actual_kernels.items() if pattern.search(name)
+        }
         for arch in actual_kernels_by_arch:
-            actual_kernels_by_arch[arch] = {name: size for name, size in actual_kernels_by_arch[arch].items() if pattern.search(name)}
+            actual_kernels_by_arch[arch] = {
+                name: size
+                for name, size in actual_kernels_by_arch[arch].items()
+                if pattern.search(name)
+            }
 
-        if args.verbose:
-            matched = len(actual_kernels)
-            if console:
-                console.print(f"\n[yellow]📋 Filter:[/yellow] Matched {matched}/{total_before} kernels with pattern '{args.filter}'")
-            else:
-                print(f"\nFilter: Matched {matched}/{total_before} kernels with pattern '{args.filter}'")
+        matched = len(actual_kernels)
+        logger.debug(
+            f"Filter matched {matched}/{total_before} kernels with pattern '{args.filter}'"
+        )
 
         if not actual_kernels:
-            print(f"No kernels matched the filter pattern '{args.filter}'")
+            logger.warning(f"No kernels matched the filter pattern '{args.filter}'")
             sys.exit(0)
 
     # Output based on format
-    if args.format == 'json':
-        output_json(all_symbols, symbols_by_arch, arch_totals, special_sections, actual_kernels)
+    if args.format == "json":
+        output_json(
+            all_symbols, symbols_by_arch, arch_totals, special_sections, actual_kernels
+        )
         return
 
     # Print results using rich tables
     if console and use_rich:
         console.print()
-        console.print(Panel.fit("[bold cyan]📊 CUDA Kernel Size Analysis Report[/bold cyan]", border_style="cyan"))
+        console.print(
+            Panel.fit(
+                "[bold cyan]📊 CUDA Kernel Size Analysis Report[/bold cyan]",
+                border_style="cyan",
+            )
+        )
 
         # Architecture summary table
         if arch_totals:
-            arch_table = Table(title="Architecture Summary", box=box.ROUNDED, show_header=True, header_style="bold magenta")
+            arch_table = Table(
+                title="Architecture Summary",
+                box=box.ROUNDED,
+                show_header=True,
+                header_style="bold magenta",
+            )
             arch_table.add_column("Architecture", style="cyan", width=15)
-            arch_table.add_column("Total Size", justify="right", style="yellow", width=15)
-            arch_table.add_column("Percentage", justify="right", style="green", width=12)
+            arch_table.add_column(
+                "Total Size", justify="right", style="yellow", width=15
+            )
+            arch_table.add_column(
+                "Percentage", justify="right", style="green", width=12
+            )
 
             total_all_arch = sum(arch_totals.values())
             for arch in sorted(arch_totals.keys()):
                 size = arch_totals[arch]
                 percentage = (size / total_all_arch * 100) if total_all_arch > 0 else 0
-                arch_table.add_row(arch.upper(), format_size(size), f"{percentage:.1f}%")
+                arch_table.add_row(
+                    arch.upper(), format_size(size), f"{percentage:.1f}%"
+                )
 
             arch_table.add_section()
-            arch_table.add_row("[bold]TOTAL[/bold]", f"[bold]{format_size(total_all_arch)}[/bold]", "[bold]100.0%[/bold]")
+            arch_table.add_row(
+                "[bold]TOTAL[/bold]",
+                f"[bold]{format_size(total_all_arch)}[/bold]",
+                "[bold]100.0%[/bold]",
+            )
             console.print(arch_table)
             console.print()
 
-        # Special sections table (debug info, metadata, etc.)
+        # Section breakdown table (code + non-code sections)
+        section_table = Table(
+            title="Section Breakdown",
+            box=box.ROUNDED,
+            show_header=True,
+            header_style="bold magenta",
+        )
+        section_table.add_column("Section Type", style="cyan", width=25)
+        section_table.add_column(
+            "Total Size", justify="right", style="yellow", width=15
+        )
+        section_table.add_column("% of Total", justify="right", style="green", width=12)
+
+        total_size = sum(all_symbols.values())
+
+        # Add code section - use real .text section size
+        if total_text_section_size > 0:
+            code_pct = (
+                (total_text_section_size / total_size * 100) if total_size > 0 else 0
+            )
+            section_table.add_row(
+                "[bold]Code Sections[/bold]",
+                f"[bold]{format_size(total_text_section_size)}[/bold]",
+                f"[bold]{code_pct:.1f}%[/bold]",
+            )
+
+        # Add special sections (debug, metadata, data)
         if special_sections:
-            special_table = Table(title="Non-Code Sections (Debug Info, Metadata, etc.)", box=box.ROUNDED, show_header=True, header_style="bold magenta")
-            special_table.add_column("Section Type", style="dim cyan", width=25)
-            special_table.add_column("Total Size", justify="right", style="yellow", width=15)
-            special_table.add_column("% of Total", justify="right", style="green", width=12)
-
-            sorted_special = sorted(special_sections.items(), key=lambda x: x[1], reverse=True)
-            total_size = sum(all_symbols.values())
-            special_total = sum(special_sections.values())
-
+            sorted_special = sorted(
+                special_sections.items(), key=lambda x: x[1], reverse=True
+            )
             for name, size in sorted_special:
-                # Remove the < > markers for display
-                display_name = name.strip('<>')
+                display_name = name.strip("<>")
                 percentage = (size / total_size * 100) if total_size > 0 else 0
-                special_table.add_row(display_name, format_size(size), f"{percentage:.1f}%")
+                section_table.add_row(
+                    display_name, format_size(size), f"{percentage:.1f}%"
+                )
 
-            special_table.add_section()
-            special_pct = (special_total / total_size * 100) if total_size > 0 else 0
-            special_table.add_row("[bold]SUBTOTAL[/bold]", f"[bold]{format_size(special_total)}[/bold]", f"[bold]{special_pct:.1f}%[/bold]")
-            console.print(special_table)
-            console.print()
+        section_table.add_section()
+        section_table.add_row(
+            "[bold]TOTAL[/bold]",
+            f"[bold]{format_size(total_size)}[/bold]",
+            "[bold]100.0%[/bold]",
+        )
+        console.print(section_table)
+        console.print()
 
         # Overall top kernels table
-        title = "Top CUDA Kernels (All Architectures)" if not args.arch else f"Top CUDA Kernels ({args.arch.upper()})"
+        title = (
+            "Top CUDA Kernels (All Architectures)"
+            if not args.arch
+            else f"Top CUDA Kernels ({args.arch.upper()})"
+        )
         if args.filter:
             title += f" - Filter: '{args.filter}'"
-        kernel_table = Table(title=title, box=box.ROUNDED, show_header=True, header_style="bold magenta")
+        kernel_table = Table(
+            title=title, box=box.ROUNDED, show_header=True, header_style="bold magenta"
+        )
         kernel_table.add_column("Rank", style="dim", width=6, justify="right")
         name_width = 120 if args.full_names else 70
         kernel_table.add_column("Kernel Name", style="cyan", width=name_width)
         kernel_table.add_column("Code Size", justify="right", style="yellow", width=12)
         kernel_table.add_column("% of Code", justify="right", style="green", width=10)
 
-        sorted_kernels = sorted(actual_kernels.items(), key=lambda x: x[1], reverse=True)
+        sorted_kernels = sorted(
+            actual_kernels.items(), key=lambda x: x[1], reverse=True
+        )
         kernels_total_size = sum(actual_kernels.values())
         total_size = sum(all_symbols.values())
 
@@ -651,16 +811,32 @@ Examples:
         display_count = min(args.top, len(sorted_kernels))
         for idx, (name, size) in enumerate(sorted_kernels[:display_count], 1):
             # Percentage relative to kernel code only
-            percentage = (size / kernels_total_size * 100) if kernels_total_size > 0 else 0
-            short_name = name if args.full_names else shorten_kernel_name(name, name_width)
-            kernel_table.add_row(str(idx), short_name, format_size(size), f"{percentage:.1f}%")
+            percentage = (
+                (size / kernels_total_size * 100) if kernels_total_size > 0 else 0
+            )
+            short_name = (
+                name if args.full_names else shorten_kernel_name(name, name_width)
+            )
+            kernel_table.add_row(
+                str(idx), short_name, format_size(size), f"{percentage:.1f}%"
+            )
 
         if len(sorted_kernels) > display_count:
-            kernel_table.add_row("...", f"[dim]({len(sorted_kernels) - display_count} more kernels)[/dim]", "", "")
+            kernel_table.add_row(
+                "...",
+                f"[dim]({len(sorted_kernels) - display_count} more kernels)[/dim]",
+                "",
+                "",
+            )
 
         kernel_table.add_section()
         kernels_pct = (kernels_total_size / total_size * 100) if total_size > 0 else 0
-        kernel_table.add_row("", "[bold]TOTAL KERNEL CODE[/bold]", f"[bold]{format_size(kernels_total_size)}[/bold]", f"[bold]{kernels_pct:.1f}% of file[/bold]")
+        kernel_table.add_row(
+            "",
+            "[bold]TOTAL KERNEL CODE[/bold]",
+            f"[bold]{format_size(kernels_total_size)}[/bold]",
+            f"[bold]{kernels_pct:.1f}% of file[/bold]",
+        )
         console.print(kernel_table)
 
         # Per-architecture breakdown (only if not filtering and multiple archs)
@@ -668,70 +844,114 @@ Examples:
             for arch in sorted(actual_kernels_by_arch.keys()):
                 console.print()
                 arch_kernels = actual_kernels_by_arch[arch]
-                arch_sorted = sorted(arch_kernels.items(), key=lambda x: x[1], reverse=True)
+                arch_sorted = sorted(
+                    arch_kernels.items(), key=lambda x: x[1], reverse=True
+                )
                 arch_kernel_total = sum(arch_kernels.values())
 
-                per_arch_table = Table(title=f"CUDA Kernels for {arch.upper()}", box=box.ROUNDED, show_header=True, header_style="bold magenta")
+                per_arch_table = Table(
+                    title=f"CUDA Kernels for {arch.upper()}",
+                    box=box.ROUNDED,
+                    show_header=True,
+                    header_style="bold magenta",
+                )
                 per_arch_table.add_column("Rank", style="dim", width=6, justify="right")
                 per_arch_table.add_column("Kernel Name", style="cyan", width=name_width)
-                per_arch_table.add_column("Code Size", justify="right", style="yellow", width=12)
-                per_arch_table.add_column("% of Code", justify="right", style="green", width=10)
+                per_arch_table.add_column(
+                    "Code Size", justify="right", style="yellow", width=12
+                )
+                per_arch_table.add_column(
+                    "% of Code", justify="right", style="green", width=10
+                )
 
                 # Show top 15 per architecture
                 arch_display = min(15, len(arch_sorted))
                 for idx, (name, size) in enumerate(arch_sorted[:arch_display], 1):
-                    percentage = (size / arch_kernel_total * 100) if arch_kernel_total > 0 else 0
-                    short_name = name if args.full_names else shorten_kernel_name(name, name_width)
-                    per_arch_table.add_row(str(idx), short_name, format_size(size), f"{percentage:.1f}%")
+                    percentage = (
+                        (size / arch_kernel_total * 100) if arch_kernel_total > 0 else 0
+                    )
+                    short_name = (
+                        name
+                        if args.full_names
+                        else shorten_kernel_name(name, name_width)
+                    )
+                    per_arch_table.add_row(
+                        str(idx), short_name, format_size(size), f"{percentage:.1f}%"
+                    )
 
                 if len(arch_sorted) > arch_display:
-                    per_arch_table.add_row("...", f"[dim]({len(arch_sorted) - arch_display} more kernels)[/dim]", "", "")
+                    per_arch_table.add_row(
+                        "...",
+                        f"[dim]({len(arch_sorted) - arch_display} more kernels)[/dim]",
+                        "",
+                        "",
+                    )
 
                 per_arch_table.add_section()
-                per_arch_table.add_row("", "[bold]TOTAL KERNEL CODE[/bold]", f"[bold]{format_size(arch_kernel_total)}[/bold]", "[bold]100.0%[/bold]")
+                per_arch_table.add_row(
+                    "",
+                    "[bold]TOTAL KERNEL CODE[/bold]",
+                    f"[bold]{format_size(arch_kernel_total)}[/bold]",
+                    "[bold]100.0%[/bold]",
+                )
                 console.print(per_arch_table)
 
         console.print("\n[bold green]✓ Analysis complete![/bold green]\n")
     else:
         # Fallback to basic output
-        print("\n" + "="*100)
+        print("\n" + "=" * 100)
         print("CUDA Kernel Size Report")
-        print("="*100)
+        print("=" * 100)
 
         # Print special sections first
         if special_sections:
             print("\nNon-Code Sections (Debug Info, Metadata, etc.):")
-            print("-"*100)
-            sorted_special = sorted(special_sections.items(), key=lambda x: x[1], reverse=True)
+            print("-" * 100)
+            sorted_special = sorted(
+                special_sections.items(), key=lambda x: x[1], reverse=True
+            )
             total_size = sum(all_symbols.values())
             for name, size in sorted_special:
-                display_name = name.strip('<>')
+                display_name = name.strip("<>")
                 percentage = (size / total_size * 100) if total_size > 0 else 0
                 print(f"{display_name:<70} {format_size(size):>15} {percentage:>9.1f}%")
             print()
 
         # Print actual kernels
-        sorted_kernels = sorted(actual_kernels.items(), key=lambda x: x[1], reverse=True)
+        sorted_kernels = sorted(
+            actual_kernels.items(), key=lambda x: x[1], reverse=True
+        )
         kernels_total_size = sum(actual_kernels.values())
         total_size = sum(all_symbols.values())
 
         name_width = 90 if args.full_names else 70
-        print(f"\n{'CUDA Kernel Name':<{name_width}} {'Code Size':>15} {'% of Code':>12}")
-        print("-"*100)
+        print(
+            f"\n{'CUDA Kernel Name':<{name_width}} {'Code Size':>15} {'% of Code':>12}"
+        )
+        print("-" * 100)
 
         display_count = min(args.top, len(sorted_kernels))
         for name, size in sorted_kernels[:display_count]:
-            percentage = (size / kernels_total_size * 100) if kernels_total_size > 0 else 0
-            short_name = name if args.full_names else shorten_kernel_name(name, name_width)
-            print(f"{short_name:<{name_width}} {format_size(size):>15} {percentage:>11.1f}%")
+            percentage = (
+                (size / kernels_total_size * 100) if kernels_total_size > 0 else 0
+            )
+            short_name = (
+                name if args.full_names else shorten_kernel_name(name, name_width)
+            )
+            print(
+                f"{short_name:<{name_width}} {format_size(size):>15} {percentage:>11.1f}%"
+            )
 
         if len(sorted_kernels) > display_count:
             print(f"... ({len(sorted_kernels) - display_count} more kernels)")
 
-        print("-"*100)
+        print("-" * 100)
         kernels_pct = (kernels_total_size / total_size * 100) if total_size > 0 else 0
-        print(f"{'TOTAL KERNEL CODE':<{name_width}} {format_size(kernels_total_size):>15} {kernels_pct:>10.1f}% of file")
+        print(
+            f"{'TOTAL KERNEL CODE':<{name_width}} {format_size(kernels_total_size):>15} {kernels_pct:>10.1f}% of file"
+        )
         print()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
