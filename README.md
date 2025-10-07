@@ -207,6 +207,7 @@ Cubloaty requires the following tools to be installed and available in your `PAT
 - **gcc/g++** - for `c++filt` (symbol demangling)
 
 On Ubuntu/Debian:
+
 ```bash
 sudo apt-get install binutils gcc
 ```
@@ -215,13 +216,16 @@ CUDA Toolkit can be downloaded from [NVIDIA's website](https://developer.nvidia.
 
 ## Installation
 
-```bash
-pip install -e .
+Install the package from pypi:
+
+```
+pip install cubloaty
 ```
 
-Or install directly from git:
+Or git clone the repo and install from source:
 ```bash
-pip install git+https://github.com/flashinfer-ai/cubloaty.git
+git clone https://github.com/flashinfer-ai/cubloaty.git
+pip install -e . -v  # editable mode
 ```
 
 ## Usage
